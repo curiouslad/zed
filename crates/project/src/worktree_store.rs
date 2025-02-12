@@ -12,10 +12,11 @@ use futures::{
     future::{BoxFuture, Shared},
     FutureExt, SinkExt,
 };
+use git::repository::Branch;
 use gpui::{App, AsyncApp, Context, Entity, EntityId, EventEmitter, Task, WeakEntity};
 use postage::oneshot;
 use rpc::{
-    proto::{self, SSH_PROJECT_ID},
+    proto::{self, FromProto, ToProto, SSH_PROJECT_ID},
     AnyProtoClient, ErrorExt, TypedEnvelope,
 };
 use smol::{
@@ -24,7 +25,10 @@ use smol::{
 };
 use text::ReplicaId;
 use util::{paths::SanitizedPath, ResultExt};
-use worktree::{Entry, ProjectEntryId, UpdatedEntriesSet, Worktree, WorktreeId, WorktreeSettings};
+use worktree::{
+    branch_to_proto, Entry, ProjectEntryId, UpdatedEntriesSet, Worktree, WorktreeId,
+    WorktreeSettings,
+};
 
 use crate::{search::SearchQuery, ProjectPath};
 
@@ -56,6 +60,7 @@ pub struct WorktreeStore {
     state: WorktreeStoreState,
 }
 
+#[derive(Debug)]
 pub enum WorktreeStoreEvent {
     WorktreeAdded(Entity<Worktree>),
     WorktreeRemoved(EntityId, WorktreeId),
@@ -71,12 +76,13 @@ impl EventEmitter<WorktreeStoreEvent> for WorktreeStore {}
 
 impl WorktreeStore {
     pub fn init(client: &AnyProtoClient) {
-        client.add_model_request_handler(Self::handle_create_project_entry);
-        client.add_model_request_handler(Self::handle_copy_project_entry);
-        client.add_model_request_handler(Self::handle_delete_project_entry);
-        client.add_model_request_handler(Self::handle_expand_project_entry);
-        client.add_model_request_handler(Self::handle_git_branches);
-        client.add_model_request_handler(Self::handle_update_branch);
+        client.add_entity_request_handler(Self::handle_create_project_entry);
+        client.add_entity_request_handler(Self::handle_copy_project_entry);
+        client.add_entity_request_handler(Self::handle_delete_project_entry);
+        client.add_entity_request_handler(Self::handle_expand_project_entry);
+        client.add_entity_request_handler(Self::handle_expand_all_for_project_entry);
+        client.add_entity_request_handler(Self::handle_git_branches);
+        client.add_entity_request_handler(Self::handle_update_branch);
     }
 
     pub fn local(retain_worktrees: bool, fs: Arc<dyn Fs>) -> Self {
@@ -131,11 +137,12 @@ impl WorktreeStore {
             .find(|worktree| worktree.read(cx).id() == id)
     }
 
-    pub fn current_branch(&self, repository: ProjectPath, cx: &App) -> Option<Arc<str>> {
+    pub fn current_branch(&self, repository: ProjectPath, cx: &App) -> Option<Branch> {
         self.worktree_for_id(repository.worktree_id, cx)?
             .read(cx)
             .git_entry(repository.path)?
             .branch()
+            .cloned()
     }
 
     pub fn worktree_for_entry(
@@ -266,10 +273,11 @@ impl WorktreeStore {
         cx.spawn(|this, mut cx| async move {
             let this = this.upgrade().context("Dropped worktree store")?;
 
+            let path = Path::new(abs_path.as_str());
             let response = client
                 .request(proto::AddWorktree {
                     project_id: SSH_PROJECT_ID,
-                    path: abs_path.clone(),
+                    path: path.to_proto(),
                     visible,
                 })
                 .await?;
@@ -280,10 +288,11 @@ impl WorktreeStore {
                 return Ok(existing_worktree);
             }
 
-            let root_name = PathBuf::from(&response.canonicalized_path)
+            let root_path_buf = PathBuf::from_proto(response.canonicalized_path.clone());
+            let root_name = root_path_buf
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or(response.canonicalized_path.to_string());
+                .unwrap_or(root_path_buf.to_string_lossy().to_string());
 
             let worktree = cx.update(|cx| {
                 Worktree::remote(
@@ -594,7 +603,7 @@ impl WorktreeStore {
                     id: worktree.id().to_proto(),
                     root_name: worktree.root_name().into(),
                     visible: worktree.is_visible(),
-                    abs_path: worktree.abs_path().to_string_lossy().into(),
+                    abs_path: worktree.abs_path().to_proto(),
                 }
             })
             .collect()
@@ -921,7 +930,7 @@ impl WorktreeStore {
                     project_id: remote_worktree.project_id(),
                     repository: Some(proto::ProjectPath {
                         worktree_id: project_path.worktree_id.to_proto(),
-                        path: project_path.path.to_string_lossy().to_string(), // Root path
+                        path: project_path.path.to_proto(), // Root path
                     }),
                 });
 
@@ -934,9 +943,24 @@ impl WorktreeStore {
                         .map(|proto_branch| git::repository::Branch {
                             is_head: proto_branch.is_head,
                             name: proto_branch.name.into(),
-                            unix_timestamp: proto_branch
-                                .unix_timestamp
-                                .map(|timestamp| timestamp as i64),
+                            upstream: proto_branch.upstream.map(|upstream| {
+                                git::repository::Upstream {
+                                    ref_name: upstream.ref_name.into(),
+                                    tracking: upstream.tracking.map(|tracking| {
+                                        git::repository::UpstreamTracking {
+                                            ahead: tracking.ahead as u32,
+                                            behind: tracking.behind as u32,
+                                        }
+                                    }),
+                                }
+                            }),
+                            most_recent_commit: proto_branch.most_recent_commit.map(|commit| {
+                                git::repository::CommitSummary {
+                                    sha: commit.sha.into(),
+                                    subject: commit.subject.into(),
+                                    commit_timestamp: commit.commit_timestamp,
+                                }
+                            }),
                         })
                         .collect();
 
@@ -992,7 +1016,7 @@ impl WorktreeStore {
                     project_id: remote_worktree.project_id(),
                     repository: Some(proto::ProjectPath {
                         worktree_id: repository.worktree_id.to_proto(),
-                        path: repository.path.to_string_lossy().to_string(), // Root path
+                        path: repository.path.to_proto(), // Root path
                     }),
                     branch_name: new_branch,
                 });
@@ -1025,9 +1049,10 @@ impl WorktreeStore {
             {
                 // Before attempting to match the file content, throw away files that have invalid UTF-8 sequences early on;
                 // That way we can still match files in a streaming fashion without having look at "obviously binary" files.
-                return Err(anyhow!(
+                log::debug!(
                     "Invalid UTF-8 sequence in file {abs_path:?} at byte position {starting_position}"
-                ));
+                );
+                continue;
             }
 
             if query.detect(file).unwrap_or(false) {
@@ -1089,6 +1114,18 @@ impl WorktreeStore {
         Worktree::handle_expand_entry(worktree, envelope.payload, cx).await
     }
 
+    pub async fn handle_expand_all_for_project_entry(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ExpandAllForProjectEntry>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::ExpandAllForProjectEntryResponse> {
+        let entry_id = ProjectEntryId::from_proto(envelope.payload.entry_id);
+        let worktree = this
+            .update(&mut cx, |this, cx| this.worktree_for_entry(entry_id, cx))?
+            .ok_or_else(|| anyhow!("invalid request"))?;
+        Worktree::handle_expand_all_for_entry(worktree, envelope.payload, cx).await
+    }
+
     pub async fn handle_git_branches(
         this: Entity<Self>,
         branches: TypedEnvelope<proto::GitBranches>,
@@ -1101,7 +1138,7 @@ impl WorktreeStore {
             .context("Invalid GitBranches call")?;
         let project_path = ProjectPath {
             worktree_id: WorktreeId::from_proto(project_path.worktree_id),
-            path: Path::new(&project_path.path).into(),
+            path: Arc::<Path>::from_proto(project_path.path),
         };
 
         let branches = this
@@ -1109,14 +1146,7 @@ impl WorktreeStore {
             .await?;
 
         Ok(proto::GitBranchesResponse {
-            branches: branches
-                .into_iter()
-                .map(|branch| proto::Branch {
-                    is_head: branch.is_head,
-                    name: branch.name.to_string(),
-                    unix_timestamp: branch.unix_timestamp.map(|timestamp| timestamp as u64),
-                })
-                .collect(),
+            branches: branches.iter().map(branch_to_proto).collect(),
         })
     }
 
@@ -1132,7 +1162,7 @@ impl WorktreeStore {
             .context("Invalid GitBranches call")?;
         let project_path = ProjectPath {
             worktree_id: WorktreeId::from_proto(project_path.worktree_id),
-            path: Path::new(&project_path.path).into(),
+            path: Arc::<Path>::from_proto(project_path.path),
         };
         let new_branch = update_branch.payload.branch_name;
 
